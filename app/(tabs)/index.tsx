@@ -1,11 +1,14 @@
 import { useAuth } from '@/context/AuthContext';
 import { apiFetch } from '@/lib/api';
 import { Ionicons } from '@expo/vector-icons';
+import { useBottomTabBarHeight } from '@react-navigation/bottom-tabs';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Haptics from 'expo-haptics';
 import { Image } from 'expo-image';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Print from 'expo-print';
 import { router } from 'expo-router';
+import * as Sharing from 'expo-sharing';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -840,6 +843,7 @@ const co = StyleSheet.create({
 ══════════════════════════════════════════════ */
 export default function POSScreen() {
   const { user, logout } = useAuth();
+  const tabBarH = useBottomTabBarHeight();
 
   const [products, setProducts] = useState<Product[]>([]);
   const [loadingProducts, setLoadingProducts] = useState(true);
@@ -1039,37 +1043,106 @@ export default function POSScreen() {
   /* Print receipt */
   const handlePrint = async (sale: SaleDetail) => {
     try {
-      const Print = await import('expo-print');
-      const Sharing = await import('expo-sharing');
-      const items = sale.items.map(i =>
-        `<tr><td>${i.name}</td><td style="text-align:center">${i.quantity}</td><td style="text-align:right">$${i.price.toFixed(2)}</td><td style="text-align:right">$${i.lineTotal.toFixed(2)}</td></tr>`
-      ).join('');
-      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/><style>
-        body{font-family:monospace;font-size:12px;max-width:300px;margin:0 auto;padding:10px;}
-        h2{text-align:center;font-size:16px;margin:0 0 4px;}
-        p{text-align:center;font-size:10px;color:#555;margin:2px 0;}
-        table{width:100%;border-collapse:collapse;margin:8px 0;}
-        th{font-size:9px;text-transform:uppercase;border-bottom:1px solid #ccc;padding:4px 2px;}
-        td{padding:4px 2px;font-size:11px;vertical-align:top;}
-        .row{display:flex;justify-content:space-between;padding:2px 0;font-size:11px;}
-        .total{font-weight:bold;font-size:14px;border-top:2px solid #000;margin-top:4px;padding-top:4px;}
-        .footer{text-align:center;font-size:10px;color:#666;margin-top:12px;border-top:1px dashed #ccc;padding-top:8px;}
-      </style></head><body>
-        <h2>Receipt</h2>
-        <p>${sale.invoiceNumber}</p>
-        <p>${new Date(sale.timestamp).toLocaleString()}</p>
-        <p>Customer: ${sale.customerName} | Cashier: ${sale.cashier}</p>
-        <table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Total</th></tr></thead><tbody>${items}</tbody></table>
-        <div class="row"><span>Subtotal</span><span>$${(sale.subtotal ?? 0).toFixed(2)}</span></div>
-        ${(sale.discount ?? 0) > 0 ? `<div class="row"><span>Discount</span><span>-$${sale.discount.toFixed(2)}</span></div>` : ''}
-        ${(sale.tax ?? 0) > 0 ? `<div class="row"><span>${sale.taxName || 'Tax'}</span><span>$${sale.tax.toFixed(2)}</span></div>` : ''}
-        <div class="row total"><span>TOTAL</span><span>$${sale.total.toFixed(2)}</span></div>
-        ${sale.cashReceived ? `<div class="row"><span>Cash</span><span>$${sale.cashReceived.toFixed(2)}</span></div>` : ''}
-        ${sale.change ? `<div class="row"><span>Change</span><span>$${sale.change.toFixed(2)}</span></div>` : ''}
-        <div class="footer">Thank you for your business!</div>
+
+      const STATUS_BG: Record<string, string> = {
+        completed: '#DCFCE7', pending: '#EDE9FE', processing: '#DBEAFE',
+        cancelled: '#FEE2E2', refunded: '#FEF3C7',
+      };
+      const STATUS_TEXT: Record<string, string> = {
+        completed: '#16A34A', pending: '#7C3AED', processing: '#2563EB',
+        cancelled: '#DC2626', refunded: '#D97706',
+      };
+      const sBg  = STATUS_BG[sale.status]   || '#F3F4F6';
+      const sTxt = STATUS_TEXT[sale.status] || '#374151';
+      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&bgcolor=ffffff&color=0C0A2E&margin=6&data=${encodeURIComponent(sale.invoiceNumber)}`;
+
+      const itemRows = sale.items.map((i, idx) => `
+        <tr style="background:${idx % 2 === 0 ? '#fff' : '#FAFAFA'}">
+          <td style="padding:11px 20px;font-size:13px;font-weight:600;color:#111827;">${i.name}</td>
+          <td style="padding:11px 20px;text-align:center;">
+            <span style="background:#EEF2FF;color:#6366F1;font-weight:700;font-size:12px;padding:3px 10px;border-radius:6px;">${i.quantity}</span>
+          </td>
+          <td style="padding:11px 20px;text-align:right;font-size:13px;color:#6B7280;">$${i.price.toFixed(2)}</td>
+          <td style="padding:11px 20px;text-align:right;font-size:13px;font-weight:700;color:#111827;">$${i.lineTotal.toFixed(2)}</td>
+        </tr>`).join('');
+
+      const discountRows = [
+        (sale.discount ?? 0) > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">Discount</span><span style="color:#10B981;font-weight:600;">−$${sale.discount.toFixed(2)}</span></div>` : '',
+        (sale.flatDiscount ?? 0) > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">Flat Discount</span><span style="color:#10B981;font-weight:600;">−$${(sale.flatDiscount ?? 0).toFixed(2)}</span></div>` : '',
+        sale.couponCode && (sale.couponDiscount ?? 0) > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">Coupon (${sale.couponCode})</span><span style="color:#10B981;font-weight:600;">−$${(sale.couponDiscount ?? 0).toFixed(2)}</span></div>` : '',
+      ].join('');
+
+      const taxRow = (sale.tax ?? 0) > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">${sale.taxName || 'Tax'}${sale.taxRate ? ` (${sale.taxRate}%)` : ''}</span><span style="font-weight:600;color:#111827;">$${sale.tax.toFixed(2)}</span></div>` : '';
+
+      const cashAmt   = sale.cashReceived ?? 0;
+      const changeAmt = sale.change ?? (cashAmt > sale.total ? cashAmt - sale.total : 0);
+      const cashRows  = cashAmt > 0 && sale.paymentMethod === 'cash' ? `
+        <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:10px;padding-top:10px;border-top:1px solid #E5E7EB;">
+          <span style="color:#6B7280;">Cash Received</span><span style="font-weight:600;">$${cashAmt.toFixed(2)}</span>
+        </div>
+        ${changeAmt > 0 ? `<div style="display:flex;justify-content:space-between;font-size:13px;margin-top:6px;"><span style="color:#6B7280;">Change</span><span style="color:#F59E0B;font-weight:700;">$${changeAmt.toFixed(2)}</span></div>` : ''}` : '';
+
+      const noteSection = sale.note ? `<div style="margin:0 24px 16px;background:#FFFBEB;border-left:4px solid #F59E0B;border-radius:8px;padding:12px 14px;"><div style="font-size:10px;font-weight:700;color:#92400E;letter-spacing:0.8px;margin-bottom:4px;">NOTE</div><div style="font-size:13px;color:#92400E;">${sale.note}</div></div>` : '';
+
+      const html = `<!DOCTYPE html><html><head><meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width,initial-scale=1"/>
+      <style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:-apple-system,Arial,Helvetica,sans-serif;background:#fff;color:#111827;max-width:680px;margin:0 auto;}</style>
+      </head><body>
+      <div style="background:linear-gradient(135deg,#0C0A2E 0%,#17105C 55%,#2D1B69 100%);padding:36px 28px 28px;text-align:center;position:relative;overflow:hidden;">
+        <div style="position:absolute;width:240px;height:240px;border-radius:120px;background:rgba(99,102,241,0.15);top:-80px;right:-60px;"></div>
+        <div style="font-size:26px;font-weight:900;color:#fff;letter-spacing:-0.5px;position:relative;">POS Receipt</div>
+        <div style="font-size:12px;color:rgba(255,255,255,0.45);margin-top:4px;position:relative;">Sales Invoice</div>
+        <div style="display:inline-block;margin-top:14px;padding:5px 16px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:1px;background:${sBg};color:${sTxt};position:relative;">${sale.status.toUpperCase()}</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:20px;padding:22px 24px;border-bottom:1px solid #E5E7EB;background:#FAFBFF;">
+        <div style="flex-shrink:0;background:#fff;border:2px solid #E5E7EB;border-radius:14px;padding:8px;box-shadow:0 2px 8px rgba(99,102,241,0.1);">
+          <img src="${qrUrl}" style="width:110px;height:110px;display:block;border-radius:6px;" />
+        </div>
+        <div style="flex:1;">
+          <div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:1.2px;text-transform:uppercase;">Invoice Number</div>
+          <div style="font-size:19px;font-weight:900;color:#111827;margin:5px 0 3px;letter-spacing:-0.3px;">${sale.invoiceNumber}</div>
+          <div style="font-size:12px;color:#6B7280;margin-bottom:10px;">${new Date(sale.timestamp).toLocaleString()}</div>
+          <div style="font-size:11px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:3px;">Amount Due</div>
+          <div style="font-size:32px;font-weight:900;color:#6366F1;letter-spacing:-1px;">$${sale.total.toFixed(2)}</div>
+        </div>
+      </div>
+      <div style="display:flex;padding:16px 24px;background:#F9FAFB;border-bottom:1px solid #E5E7EB;gap:16px;">
+        <div style="flex:1;"><div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:5px;">Customer</div><div style="font-size:13px;font-weight:700;color:#111827;">${sale.customerName}</div></div>
+        <div style="flex:1;"><div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:5px;">Cashier</div><div style="font-size:13px;font-weight:700;color:#111827;">${sale.cashier}</div></div>
+        <div style="flex:1;"><div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:5px;">Payment</div><div style="font-size:13px;font-weight:700;color:#111827;">${normalizePaymentType(sale.paymentMethod)}</div></div>
+      </div>
+      <div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:1px;text-transform:uppercase;padding:16px 24px 10px;">Items (${sale.items.length})</div>
+      <table style="width:100%;border-collapse:collapse;">
+        <thead><tr style="background:#F3F4F6;">
+          <th style="padding:10px 20px;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;text-align:left;">Item</th>
+          <th style="padding:10px 20px;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;text-align:center;">Qty</th>
+          <th style="padding:10px 20px;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;text-align:right;">Price</th>
+          <th style="padding:10px 20px;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;text-align:right;">Total</th>
+        </tr></thead>
+        <tbody>${itemRows}</tbody>
+      </table>
+      <div style="padding:20px 24px;border-top:1px solid #E5E7EB;">
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">Subtotal</span><span style="font-weight:600;color:#111827;">$${(sale.subtotal ?? 0).toFixed(2)}</span></div>
+        ${discountRows}${taxRow}
+        <div style="display:flex;justify-content:space-between;border-top:2px solid #6366F1;padding-top:14px;margin-top:10px;">
+          <span style="font-size:17px;font-weight:800;color:#111827;">Total</span>
+          <span style="font-size:28px;font-weight:900;color:#6366F1;letter-spacing:-0.5px;">$${sale.total.toFixed(2)}</span>
+        </div>${cashRows}
+      </div>
+      ${noteSection}
+      <div style="text-align:center;padding:28px 24px 36px;border-top:1px dashed #D1D5DB;">
+        <div style="font-size:20px;font-weight:900;color:#111827;margin-bottom:6px;">Thank You!</div>
+        <div style="font-size:13px;color:#9CA3AF;margin-bottom:16px;">We appreciate your business.</div>
+        <div style="display:inline-block;background:#EEF2FF;border-radius:10px;padding:8px 16px;">
+          <div style="font-size:10px;color:#9CA3AF;margin-bottom:3px;">Scan QR to verify</div>
+          <div style="font-size:11px;font-weight:700;color:#6366F1;font-family:monospace;">${sale.invoiceNumber}</div>
+        </div>
+        <div style="font-size:10px;color:#D1D5DB;margin-top:16px;">Powered by POS System</div>
+      </div>
       </body></html>`;
+
       const { uri } = await Print.printToFileAsync({ html, base64: false });
-      await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: `Receipt ${sale.invoiceNumber}` });
+      await Sharing.shareAsync(uri, { mimeType: 'application/pdf', dialogTitle: `Receipt ${sale.invoiceNumber}`, UTI: 'com.adobe.pdf' });
     } catch (e: any) { Alert.alert('Print Error', e.message); }
   };
 
@@ -1311,7 +1384,7 @@ export default function POSScreen() {
         )}
 
         {itemCount > 0 && (
-          <TouchableOpacity style={s.cartFab} onPress={() => setView('cart')} activeOpacity={0.85}>
+          <TouchableOpacity style={[s.cartFab, { marginBottom: tabBarH + 4 }]} onPress={() => setView('cart')} activeOpacity={0.85}>
             <View style={s.cartFabLeft}>
               <Ionicons name="cart" size={20} color="#fff" />
               <View style={s.cartFabBadge}><Text style={s.cartFabBadgeTxt}>{itemCount}</Text></View>
@@ -1527,7 +1600,7 @@ export default function POSScreen() {
         </View>
       </ScrollView>
 
-      <View style={s.checkoutWrap}>
+      <View style={[s.checkoutWrap, { paddingBottom: tabBarH + 8 }]}>
         <TouchableOpacity style={[s.checkoutBtn, cart.length === 0 && { opacity: 0.4 }]}
           onPress={() => setShowCheckout(true)} disabled={cart.length === 0}>
           <Text style={s.checkoutBtnTxt}>Review & Checkout  ${total.toFixed(2)}</Text>

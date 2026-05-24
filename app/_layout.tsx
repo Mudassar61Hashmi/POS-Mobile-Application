@@ -15,8 +15,8 @@ export default function RootLayout() {
       <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
         <Stack screenOptions={{ headerShown: false }}>
           <Stack.Screen name="index" options={{ animation: 'none' }} />
-          <Stack.Screen name="(tabs)" />
-          <Stack.Screen name="login" />
+          <Stack.Screen name="(tabs)" options={{ animation: 'fade' }} />
+          <Stack.Screen name="login" options={{ animation: 'fade_from_bottom' }} />
           <Stack.Screen name="customers" options={{ animation: 'slide_from_right' }} />
           <Stack.Screen name="orders"    options={{ animation: 'slide_from_right' }} />
           <Stack.Screen name="settings"  options={{ animation: 'slide_from_right' }} />

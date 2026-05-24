@@ -4,6 +4,7 @@ import {
   Alert,
   FlatList,
   Modal,
+  Platform,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -17,6 +18,10 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import QRCode from 'react-native-qrcode-svg';
+import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
+import { File, Directory, Paths } from 'expo-file-system';
+import { StorageAccessFramework, readAsStringAsync } from 'expo-file-system/legacy';
 import { apiFetch } from '@/lib/api';
 
 const C = {
@@ -25,6 +30,37 @@ const C = {
   border: '#E5E7EB', text: '#111827', muted: '#6B7280', light: '#9CA3AF',
   primary: '#6366F1', primaryLight: '#EEF2FF',
 };
+
+/* ─── Save a file directly to the device file manager ───────────────────────
+   Android: SAF → Downloads folder (directory picker shown once per session)
+   iOS:     app documentDirectory/receipts/ (visible in Files app)
+──────────────────────────────────────────────────────────────────────────── */
+async function saveToFileManager(
+  srcUri: string,
+  fileName: string,
+  mimeType: string
+): Promise<string> {
+  if (Platform.OS !== 'android') {
+    const dir = new Directory(Paths.document, 'receipts');
+    if (!dir.exists) dir.create({ intermediates: true });
+    const dest = new File(dir, fileName);
+    if (dest.exists) dest.delete();
+    new File(srcUri).copy(dest);
+    return dest.uri;
+  }
+
+  // Android: write to public Downloads via Storage Access Framework
+  const downloadsUri = StorageAccessFramework.getUriForDirectoryInRoot('Download');
+  const perm = await StorageAccessFramework.requestDirectoryPermissionsAsync(downloadsUri);
+  if (!perm.granted) throw new Error('Storage permission not granted. Please allow access to Downloads.');
+
+  const base64 = await readAsStringAsync(srcUri, { encoding: 'base64' });
+  // createFileAsync expects name WITHOUT extension; Android appends it based on mimeType
+  const nameNoExt = fileName.replace(/\.[^.]+$/, '');
+  const fileUri = await StorageAccessFramework.createFileAsync(perm.directoryUri, nameNoExt, mimeType);
+  await StorageAccessFramework.writeAsStringAsync(fileUri, base64, { encoding: 'base64' });
+  return fileUri;
+}
 
 type SaleRow = {
   id: string; invoiceNumber: string; cashier: string; customerName: string;
@@ -199,13 +235,362 @@ const qs = StyleSheet.create({
 });
 
 /* ════════════════════════════════════════
+   Thermal Receipt HTML  (80mm POS style)
+════════════════════════════════════════ */
+function buildThermalHtml(sale: SaleDetail): string {
+  const dash = '- - - - - - - - - - - - - - - - - -';
+  const line  = '====================================';
+
+  const pad = (left: string, right: string, total = 36) => {
+    const gap = total - left.length - right.length;
+    return left + ' '.repeat(Math.max(gap, 1)) + right;
+  };
+
+  const itemLines = sale.items.map(i => {
+    const qtyPrice = `x${i.quantity}  $${i.lineTotal.toFixed(2)}`;
+    if (i.name.length + qtyPrice.length + 1 <= 36) {
+      return pad(i.name, qtyPrice);
+    }
+    const name1 = i.name.substring(0, 34);
+    const name2 = i.name.substring(34);
+    return `${name1}\n  ${name2 ? name2 + '\n' : ''}${pad('', qtyPrice)}`;
+  }).join('\n');
+
+  const discLines = [
+    (sale.discount ?? 0) > 0       ? pad('Discount',                            `-$${sale.discount!.toFixed(2)}`) : '',
+    (sale.flatDiscount ?? 0) > 0    ? pad('Flat Discount',                       `-$${sale.flatDiscount!.toFixed(2)}`) : '',
+    sale.couponCode && (sale.couponDiscount ?? 0) > 0
+                                    ? pad(`Coupon (${sale.couponCode})`,          `-$${sale.couponDiscount!.toFixed(2)}`) : '',
+  ].filter(Boolean).join('\n');
+
+  const taxLine = (sale.tax ?? 0) > 0
+    ? pad(`${sale.taxName || 'Tax'}${sale.taxRate ? ` (${sale.taxRate}%)` : ''}`, `$${sale.tax!.toFixed(2)}`)
+    : '';
+
+  const cashAmt   = sale.cashReceived ?? 0;
+  const changeAmt = sale.change ?? (cashAmt > sale.total ? cashAmt - sale.total : 0);
+  const cashLines = cashAmt > 0 && sale.paymentMethod === 'cash'
+    ? `${pad('Cash Received', `$${cashAmt.toFixed(2)}`)}\n${changeAmt > 0 ? pad('Change', `$${changeAmt.toFixed(2)}`) : ''}`
+    : '';
+
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&bgcolor=ffffff&color=000000&margin=4&data=${encodeURIComponent(sale.invoiceNumber)}`;
+
+  const noteLine = sale.note ? `\n${dash}\nNOTE: ${sale.note}\n` : '';
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
+  <style>
+    @page { size: 80mm auto; margin: 0; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Courier New', Courier, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      max-width: 302px;
+      margin: 0 auto;
+      padding: 12px 8px 20px;
+      background: #fff;
+      color: #000;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .center { text-align: center; display: block; }
+    .bold   { font-weight: bold; }
+    .big    { font-size: 15px; font-weight: bold; }
+    .total  { font-size: 14px; font-weight: bold; letter-spacing: 0.5px; }
+    .qr     { display: block; margin: 8px auto; width: 100px; height: 100px; }
+    .cut    { text-align: center; letter-spacing: 3px; color: #999; font-size: 10px; margin-top: 6px; }
+  </style>
+  </head><body><span class="center big">★ POS Receipt ★</span>
+<span class="center">Point of Sale System</span>
+${line}
+${pad('Invoice:', sale.invoiceNumber)}
+${pad('Date:', new Date(sale.timestamp).toLocaleString())}
+${pad('Customer:', sale.customerName)}
+${pad('Cashier:', sale.cashier)}
+${pad('Payment:', normalizePayMethod(sale.paymentMethod))}
+${dash}
+<span class="bold">${pad('ITEM', 'QTY   AMOUNT')}</span>
+${dash}
+${itemLines}
+${dash}
+${pad('Subtotal', `$${(sale.subtotal ?? 0).toFixed(2)}`)}
+${discLines}${discLines ? '\n' : ''}${taxLine}${taxLine ? '\n' : ''}${dash}
+<span class="total">${pad('** TOTAL **', `$${sale.total.toFixed(2)} **`)}</span>
+${line}
+${cashLines}${cashLines ? '\n' + line : ''}${noteLine}
+<span class="center">
+</span>
+<img class="qr" src="${qrUrl}" />
+<span class="center">Scan to verify: ${sale.invoiceNumber}</span>
+<span class="center">
+</span>
+<span class="center bold">Thank you for your business!</span>
+<span class="center">Please come again soon.</span>
+<span class="center">
+</span>
+<span class="cut">- - - ✂ CUT HERE ✂ - - -</span>
+  </body></html>`;
+}
+
+/* ════════════════════════════════════════
+   Image Receipt HTML  (card-sized portrait)
+════════════════════════════════════════ */
+function buildImageHtml(sale: SaleDetail): string {
+  const STATUS_BG: Record<string, string> = {
+    completed: '#DCFCE7', pending: '#EDE9FE', processing: '#DBEAFE',
+    cancelled: '#FEE2E2', refunded: '#FEF3C7',
+  };
+  const STATUS_TEXT: Record<string, string> = {
+    completed: '#16A34A', pending: '#7C3AED', processing: '#2563EB',
+    cancelled: '#DC2626', refunded: '#D97706',
+  };
+  const sBg  = STATUS_BG[sale.status]   || '#F3F4F6';
+  const sTxt = STATUS_TEXT[sale.status] || '#374151';
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&bgcolor=ffffff&color=0C0A2E&margin=5&data=${encodeURIComponent(sale.invoiceNumber)}`;
+
+  const itemRows = sale.items.map((i, idx) => `
+    <tr style="background:${idx % 2 === 0 ? '#fff' : '#F8F8FF'};">
+      <td style="padding:8px 12px;font-size:12px;font-weight:600;color:#111827;">${i.name}</td>
+      <td style="padding:8px 12px;text-align:center;"><span style="background:#EEF2FF;color:#6366F1;font-weight:700;font-size:11px;padding:2px 7px;border-radius:5px;">${i.quantity}</span></td>
+      <td style="padding:8px 12px;text-align:right;font-size:12px;color:#6B7280;">$${i.price.toFixed(2)}</td>
+      <td style="padding:8px 12px;text-align:right;font-size:12px;font-weight:700;color:#111827;">$${i.lineTotal.toFixed(2)}</td>
+    </tr>`).join('');
+
+  const discRows = [
+    (sale.discount ?? 0) > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:5px;font-size:11px;"><span style="color:#6B7280;">Discount</span><span style="color:#10B981;font-weight:600;">−$${sale.discount!.toFixed(2)}</span></div>` : '',
+    (sale.flatDiscount ?? 0) > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:5px;font-size:11px;"><span style="color:#6B7280;">Flat Discount</span><span style="color:#10B981;font-weight:600;">−$${sale.flatDiscount!.toFixed(2)}</span></div>` : '',
+    sale.couponCode && (sale.couponDiscount ?? 0) > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:5px;font-size:11px;"><span style="color:#6B7280;">Coupon (${sale.couponCode})</span><span style="color:#10B981;font-weight:600;">−$${sale.couponDiscount!.toFixed(2)}</span></div>` : '',
+  ].join('');
+
+  const taxRow = (sale.tax ?? 0) > 0 ? `<div style="display:flex;justify-content:space-between;margin-bottom:5px;font-size:11px;"><span style="color:#6B7280;">${sale.taxName || 'Tax'}${sale.taxRate ? ` (${sale.taxRate}%)` : ''}</span><span style="font-weight:600;">$${sale.tax!.toFixed(2)}</span></div>` : '';
+
+  const cashAmt   = sale.cashReceived ?? 0;
+  const changeAmt = sale.change ?? (cashAmt > sale.total ? cashAmt - sale.total : 0);
+  const cashRows  = cashAmt > 0 && sale.paymentMethod === 'cash'
+    ? `<div style="display:flex;justify-content:space-between;font-size:11px;margin-top:8px;padding-top:8px;border-top:1px solid #E5E7EB;"><span style="color:#6B7280;">Cash Received</span><span style="font-weight:600;">$${cashAmt.toFixed(2)}</span></div>${changeAmt > 0 ? `<div style="display:flex;justify-content:space-between;font-size:11px;margin-top:4px;"><span style="color:#6B7280;">Change</span><span style="color:#F59E0B;font-weight:700;">$${changeAmt.toFixed(2)}</span></div>` : ''}` : '';
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
+  <style>
+    @page { size: 420px 680px; margin: 0; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, Arial, sans-serif; background: #fff; width: 420px; }
+  </style>
+  </head><body>
+  <!-- Header -->
+  <div style="background:linear-gradient(135deg,#0C0A2E 0%,#17105C 55%,#2D1B69 100%);padding:22px 18px 18px;text-align:center;overflow:hidden;position:relative;">
+    <div style="position:absolute;width:160px;height:160px;border-radius:80px;background:rgba(99,102,241,0.15);top:-55px;right:-30px;"></div>
+    <div style="font-size:18px;font-weight:900;color:#fff;position:relative;">POS Receipt</div>
+    <div style="font-size:10px;color:rgba(255,255,255,0.45);margin-top:2px;position:relative;">Sales Invoice</div>
+    <div style="display:inline-block;margin-top:8px;padding:3px 12px;border-radius:14px;font-size:10px;font-weight:800;letter-spacing:0.8px;background:${sBg};color:${sTxt};position:relative;">${sale.status.toUpperCase()}</div>
+  </div>
+  <!-- QR + Invoice -->
+  <div style="display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid #E5E7EB;background:#FAFBFF;">
+    <div style="flex-shrink:0;background:#fff;border:1.5px solid #E5E7EB;border-radius:10px;padding:6px;">
+      <img src="${qrUrl}" style="width:88px;height:88px;display:block;border-radius:4px;" />
+    </div>
+    <div style="flex:1;">
+      <div style="font-size:9px;font-weight:700;color:#9CA3AF;letter-spacing:1px;text-transform:uppercase;">Invoice</div>
+      <div style="font-size:14px;font-weight:900;color:#111827;margin:3px 0 2px;">${sale.invoiceNumber}</div>
+      <div style="font-size:10px;color:#6B7280;margin-bottom:6px;">${new Date(sale.timestamp).toLocaleString()}</div>
+      <div style="font-size:9px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:2px;">Total</div>
+      <div style="font-size:22px;font-weight:900;color:#6366F1;letter-spacing:-0.5px;">$${sale.total.toFixed(2)}</div>
+    </div>
+  </div>
+  <!-- Meta -->
+  <div style="display:flex;padding:10px 16px;background:#F9FAFB;border-bottom:1px solid #E5E7EB;gap:10px;">
+    <div style="flex:1;"><div style="font-size:9px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:0.7px;margin-bottom:3px;">Customer</div><div style="font-size:11px;font-weight:700;color:#111827;">${sale.customerName}</div></div>
+    <div style="flex:1;"><div style="font-size:9px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:0.7px;margin-bottom:3px;">Cashier</div><div style="font-size:11px;font-weight:700;color:#111827;">${sale.cashier}</div></div>
+    <div style="flex:1;"><div style="font-size:9px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:0.7px;margin-bottom:3px;">Payment</div><div style="font-size:11px;font-weight:700;color:#111827;">${normalizePayMethod(sale.paymentMethod)}</div></div>
+  </div>
+  <!-- Items -->
+  <div style="font-size:9px;font-weight:700;color:#9CA3AF;letter-spacing:1px;text-transform:uppercase;padding:10px 16px 6px;">Items (${sale.items.length})</div>
+  <table style="width:100%;border-collapse:collapse;">
+    <thead><tr style="background:#F3F4F6;">
+      <th style="padding:7px 12px;font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.4px;text-align:left;">Item</th>
+      <th style="padding:7px 12px;font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.4px;text-align:center;">Qty</th>
+      <th style="padding:7px 12px;font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.4px;text-align:right;">Price</th>
+      <th style="padding:7px 12px;font-size:9px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.4px;text-align:right;">Total</th>
+    </tr></thead>
+    <tbody>${itemRows}</tbody>
+  </table>
+  <!-- Totals -->
+  <div style="padding:12px 16px;border-top:1px solid #E5E7EB;">
+    <div style="display:flex;justify-content:space-between;margin-bottom:5px;font-size:11px;"><span style="color:#6B7280;">Subtotal</span><span style="font-weight:600;">$${(sale.subtotal ?? 0).toFixed(2)}</span></div>
+    ${discRows}${taxRow}
+    <div style="display:flex;justify-content:space-between;border-top:2px solid #6366F1;padding-top:10px;margin-top:6px;">
+      <span style="font-size:13px;font-weight:800;color:#111827;">Total</span>
+      <span style="font-size:20px;font-weight:900;color:#6366F1;">$${sale.total.toFixed(2)}</span>
+    </div>
+    ${cashRows}
+  </div>
+  <!-- Footer -->
+  <div style="text-align:center;padding:14px 16px 18px;border-top:1px dashed #D1D5DB;background:#FAFBFF;">
+    <div style="font-size:14px;font-weight:900;color:#111827;margin-bottom:4px;">Thank You!</div>
+    <div style="font-size:10px;color:#9CA3AF;">We appreciate your business</div>
+    <div style="display:inline-block;margin-top:8px;background:#EEF2FF;border-radius:7px;padding:5px 12px;">
+      <div style="font-size:9px;color:#9CA3AF;margin-bottom:1px;">Scan to verify</div>
+      <div style="font-size:10px;font-weight:700;color:#6366F1;font-family:monospace;">${sale.invoiceNumber}</div>
+    </div>
+  </div>
+  </body></html>`;
+}
+
+/* ════════════════════════════════════════
+   HTML Receipt Generator  (A4 / PDF)
+════════════════════════════════════════ */
+function buildReceiptHtml(sale: SaleDetail): string {
+  const STATUS_BG: Record<string, string> = {
+    completed: '#DCFCE7', pending: '#EDE9FE', processing: '#DBEAFE',
+    cancelled: '#FEE2E2', refunded: '#FEF3C7',
+  };
+  const STATUS_TEXT: Record<string, string> = {
+    completed: '#16A34A', pending: '#7C3AED', processing: '#2563EB',
+    cancelled: '#DC2626', refunded: '#D97706',
+  };
+  const sBg   = STATUS_BG[sale.status]   || '#F3F4F6';
+  const sTxt  = STATUS_TEXT[sale.status] || '#374151';
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&bgcolor=ffffff&color=0C0A2E&margin=6&data=${encodeURIComponent(sale.invoiceNumber)}`;
+
+  const itemRows = sale.items.map((i, idx) => `
+    <tr style="background:${idx % 2 === 0 ? '#fff' : '#FAFAFA'}">
+      <td style="padding:11px 20px;font-size:13px;font-weight:600;color:#111827;">${i.name}</td>
+      <td style="padding:11px 20px;text-align:center;">
+        <span style="background:#EEF2FF;color:#6366F1;font-weight:700;font-size:12px;padding:3px 10px;border-radius:6px;">${i.quantity}</span>
+      </td>
+      <td style="padding:11px 20px;text-align:right;font-size:13px;color:#6B7280;">$${i.price.toFixed(2)}</td>
+      <td style="padding:11px 20px;text-align:right;font-size:13px;font-weight:700;color:#111827;">$${i.lineTotal.toFixed(2)}</td>
+    </tr>`).join('');
+
+  const discountRows = [
+    (sale.discount ?? 0) > 0
+      ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">Discount</span><span style="color:#10B981;font-weight:600;">−$${sale.discount!.toFixed(2)}</span></div>` : '',
+    (sale.flatDiscount ?? 0) > 0
+      ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">Flat Discount</span><span style="color:#10B981;font-weight:600;">−$${sale.flatDiscount!.toFixed(2)}</span></div>` : '',
+    sale.couponCode && (sale.couponDiscount ?? 0) > 0
+      ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">Coupon (${sale.couponCode})</span><span style="color:#10B981;font-weight:600;">−$${sale.couponDiscount!.toFixed(2)}</span></div>` : '',
+  ].join('');
+
+  const taxRow = (sale.tax ?? 0) > 0
+    ? `<div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;"><span style="color:#6B7280;">${sale.taxName || 'Tax'}${sale.taxRate ? ` (${sale.taxRate}%)` : ''}</span><span style="font-weight:600;color:#111827;">$${sale.tax!.toFixed(2)}</span></div>`
+    : '';
+
+  const cashAmt   = sale.cashReceived ?? 0;
+  const changeAmt = sale.change ?? (cashAmt > sale.total ? cashAmt - sale.total : 0);
+  const cashRows  = cashAmt > 0 && sale.paymentMethod === 'cash' ? `
+    <div style="display:flex;justify-content:space-between;font-size:13px;margin-top:10px;padding-top:10px;border-top:1px solid #E5E7EB;">
+      <span style="color:#6B7280;">Cash Received</span><span style="font-weight:600;">$${cashAmt.toFixed(2)}</span>
+    </div>
+    ${changeAmt > 0 ? `<div style="display:flex;justify-content:space-between;font-size:13px;margin-top:6px;"><span style="color:#6B7280;">Change</span><span style="color:#F59E0B;font-weight:700;">$${changeAmt.toFixed(2)}</span></div>` : ''}` : '';
+
+  const noteSection = sale.note ? `
+    <div style="margin:0 24px 16px;background:#FFFBEB;border-left:4px solid #F59E0B;border-radius:8px;padding:12px 14px;">
+      <div style="font-size:10px;font-weight:700;color:#92400E;letter-spacing:0.8px;margin-bottom:4px;">NOTE</div>
+      <div style="font-size:13px;color:#92400E;">${sale.note}</div>
+    </div>` : '';
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{font-family:-apple-system,Arial,Helvetica,sans-serif;background:#fff;color:#111827;max-width:680px;margin:0 auto;}
+    @media print{body{max-width:100%;}}
+  </style>
+  </head><body>
+
+  <!-- ▌Header gradient -->
+  <div style="background:linear-gradient(135deg,#0C0A2E 0%,#17105C 55%,#2D1B69 100%);padding:36px 28px 28px;text-align:center;position:relative;overflow:hidden;">
+    <div style="position:absolute;width:240px;height:240px;border-radius:120px;background:rgba(99,102,241,0.15);top:-80px;right:-60px;"></div>
+    <div style="position:absolute;width:120px;height:120px;border-radius:60px;background:rgba(139,92,246,0.12);bottom:-30px;left:20px;"></div>
+    <div style="font-size:26px;font-weight:900;color:#fff;letter-spacing:-0.5px;position:relative;">POS Receipt</div>
+    <div style="font-size:12px;color:rgba(255,255,255,0.45);margin-top:4px;position:relative;">Sales Invoice</div>
+    <div style="display:inline-block;margin-top:14px;padding:5px 16px;border-radius:20px;font-size:11px;font-weight:800;letter-spacing:1px;background:${sBg};color:${sTxt};position:relative;">${sale.status.toUpperCase()}</div>
+  </div>
+
+  <!-- ▌QR + Invoice info -->
+  <div style="display:flex;align-items:center;gap:20px;padding:22px 24px;border-bottom:1px solid #E5E7EB;background:#FAFBFF;">
+    <div style="flex-shrink:0;background:#fff;border:2px solid #E5E7EB;border-radius:14px;padding:8px;box-shadow:0 2px 8px rgba(99,102,241,0.1);">
+      <img src="${qrUrl}" style="width:110px;height:110px;display:block;border-radius:6px;" />
+    </div>
+    <div style="flex:1;">
+      <div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:1.2px;text-transform:uppercase;">Invoice Number</div>
+      <div style="font-size:19px;font-weight:900;color:#111827;margin:5px 0 3px;letter-spacing:-0.3px;">${sale.invoiceNumber}</div>
+      <div style="font-size:12px;color:#6B7280;margin-bottom:10px;">${new Date(sale.timestamp).toLocaleString()}</div>
+      <div style="font-size:11px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:3px;">Amount Due</div>
+      <div style="font-size:32px;font-weight:900;color:#6366F1;letter-spacing:-1px;">$${sale.total.toFixed(2)}</div>
+    </div>
+  </div>
+
+  <!-- ▌Customer / Cashier / Payment row -->
+  <div style="display:flex;padding:16px 24px;background:#F9FAFB;border-bottom:1px solid #E5E7EB;gap:16px;">
+    <div style="flex:1;">
+      <div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:5px;">Customer</div>
+      <div style="font-size:13px;font-weight:700;color:#111827;">${sale.customerName}</div>
+      ${sale.customerPhone ? `<div style="font-size:11px;color:#6B7280;margin-top:2px;">${sale.customerPhone}</div>` : ''}
+    </div>
+    <div style="flex:1;">
+      <div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:5px;">Cashier</div>
+      <div style="font-size:13px;font-weight:700;color:#111827;">${sale.cashier}</div>
+    </div>
+    <div style="flex:1;">
+      <div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:0.8px;text-transform:uppercase;margin-bottom:5px;">Payment</div>
+      <div style="font-size:13px;font-weight:700;color:#111827;">${normalizePayMethod(sale.paymentMethod)}</div>
+    </div>
+  </div>
+
+  <!-- ▌Items table -->
+  <div style="font-size:10px;font-weight:700;color:#9CA3AF;letter-spacing:1px;text-transform:uppercase;padding:16px 24px 10px;">Items (${sale.items.length})</div>
+  <table style="width:100%;border-collapse:collapse;">
+    <thead>
+      <tr style="background:#F3F4F6;">
+        <th style="padding:10px 20px;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;text-align:left;">Item</th>
+        <th style="padding:10px 20px;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;text-align:center;">Qty</th>
+        <th style="padding:10px 20px;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;text-align:right;">Price</th>
+        <th style="padding:10px 20px;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:0.5px;text-align:right;">Total</th>
+      </tr>
+    </thead>
+    <tbody>${itemRows}</tbody>
+  </table>
+
+  <!-- ▌Totals -->
+  <div style="padding:20px 24px;border-top:1px solid #E5E7EB;">
+    <div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px;">
+      <span style="color:#6B7280;">Subtotal</span>
+      <span style="font-weight:600;color:#111827;">$${(sale.subtotal ?? 0).toFixed(2)}</span>
+    </div>
+    ${discountRows}${taxRow}
+    <div style="display:flex;justify-content:space-between;border-top:2px solid #6366F1;padding-top:14px;margin-top:10px;">
+      <span style="font-size:17px;font-weight:800;color:#111827;">Total</span>
+      <span style="font-size:28px;font-weight:900;color:#6366F1;letter-spacing:-0.5px;">$${sale.total.toFixed(2)}</span>
+    </div>
+    ${cashRows}
+  </div>
+
+  ${noteSection}
+
+  <!-- ▌Footer -->
+  <div style="text-align:center;padding:28px 24px 36px;border-top:1px dashed #D1D5DB;">
+    <div style="font-size:20px;font-weight:900;color:#111827;margin-bottom:6px;">Thank You!</div>
+    <div style="font-size:13px;color:#9CA3AF;margin-bottom:16px;">We appreciate your business.</div>
+    <div style="display:inline-block;background:#EEF2FF;border-radius:10px;padding:8px 16px;">
+      <div style="font-size:10px;color:#9CA3AF;margin-bottom:3px;">Scan QR to verify</div>
+      <div style="font-size:11px;font-weight:700;color:#6366F1;font-family:monospace;">${sale.invoiceNumber}</div>
+    </div>
+    <div style="font-size:10px;color:#D1D5DB;margin-top:16px;">Powered by POS System</div>
+  </div>
+
+  </body></html>`;
+}
+
+/* ════════════════════════════════════════
    Receipt Modal (with QR Code)
 ════════════════════════════════════════ */
 function ReceiptModal({ sale, onClose, onStatusChange }: {
   sale: SaleDetail | null; onClose(): void;
   onStatusChange(id: string, status: string): void;
 }) {
-  const [changing, setChanging] = useState(false);
+  const [changing, setChanging]         = useState(false);
+  const [showExportSheet, setShowExport] = useState(false);
+  const [exporting, setExporting]        = useState<'print' | 'pdf' | 'image' | null>(null);
   if (!sale) return null;
 
   const actions = TRANSITIONS[sale.status] || [];
@@ -213,6 +598,50 @@ function ReceiptModal({ sale, onClose, onStatusChange }: {
   const changeAmt = sale.change ?? (cashAmt > sale.total ? cashAmt - sale.total : 0);
   const statusColor = STATUS_COLORS[sale.status] || '#888';
   const qrValue = sale.invoiceNumber || String(sale.id);
+
+  /* ── Export handlers ── */
+  const handleThermalPrint = async () => {
+    setExporting('print');
+    try {
+      await Print.printAsync({ html: buildThermalHtml(sale) });
+    } catch (e: any) {
+      Alert.alert('Print Error', e.message);
+    } finally { setExporting(null); setShowExport(false); }
+  };
+
+  const handlePDF = async () => {
+    setExporting('pdf');
+    try {
+      const { uri } = await Print.printToFileAsync({ html: buildReceiptHtml(sale), base64: false });
+      const name = `Receipt_${sale.invoiceNumber.replace(/[^a-zA-Z0-9]/g, '_')}.pdf`;
+      await saveToFileManager(uri, name, 'application/pdf');
+      Alert.alert(
+        'PDF Saved',
+        Platform.OS === 'android'
+          ? `"${name}" saved to Downloads folder.`
+          : `"${name}" saved.\nOpen the Files app → On My iPhone → POSAPP.`
+      );
+    } catch (e: any) {
+      Alert.alert('Export Error', e.message);
+    } finally { setExporting(null); setShowExport(false); }
+  };
+
+  const handleImage = async () => {
+    setExporting('image');
+    try {
+      const { uri } = await Print.printToFileAsync({ html: buildImageHtml(sale), base64: false });
+      const name = `Receipt_${sale.invoiceNumber.replace(/[^a-zA-Z0-9]/g, '_')}_card.pdf`;
+      await saveToFileManager(uri, name, 'application/pdf');
+      Alert.alert(
+        'Image Saved',
+        Platform.OS === 'android'
+          ? `Receipt card "${name}" saved to Downloads folder.`
+          : `Receipt card saved.\nOpen the Files app → On My iPhone → POSAPP.`
+      );
+    } catch (e: any) {
+      Alert.alert('Export Error', e.message);
+    } finally { setExporting(null); setShowExport(false); }
+  };
 
   const doStatusChange = (newStatus: string) => {
     Alert.alert(
@@ -247,12 +676,18 @@ function ReceiptModal({ sale, onClose, onStatusChange }: {
           <View style={[rm.statusPill, { backgroundColor: statusColor }]}>
             <Text style={rm.statusPillTxt}>{sale.status.toUpperCase()}</Text>
           </View>
+          {/* Export icon button in header */}
+          <TouchableOpacity onPress={() => setShowExport(true)} style={rm.printIconBtn} disabled={!!exporting}>
+            {exporting
+              ? <ActivityIndicator size="small" color="rgba(255,255,255,0.8)" />
+              : <Ionicons name="share-outline" size={20} color="rgba(255,255,255,0.85)" />}
+          </TouchableOpacity>
           <TouchableOpacity onPress={onClose} style={rm.closeBtn}>
             <Ionicons name="close" size={22} color="rgba(255,255,255,0.7)" />
           </TouchableOpacity>
         </LinearGradient>
 
-        {changing && (
+        {(changing || !!exporting) && (
           <View style={rm.overlay}><ActivityIndicator color="#fff" size="large" /></View>
         )}
 
@@ -411,7 +846,105 @@ function ReceiptModal({ sale, onClose, onStatusChange }: {
               </>
             );
           })()}
+
+          {/* ── Export button ── */}
+          <TouchableOpacity
+            style={[rm.printBtn, !!exporting && { opacity: 0.6 }]}
+            onPress={() => setShowExport(true)}
+            disabled={!!exporting}
+            activeOpacity={0.85}
+          >
+            <LinearGradient colors={['#0C0A2E', '#17105C']} style={rm.printBtnGrad}>
+              <Ionicons name="share-social-outline" size={18} color="#fff" />
+              <Text style={rm.printBtnTxt}>Print / Export Receipt</Text>
+              <Ionicons name="chevron-up" size={15} color="rgba(255,255,255,0.5)" />
+            </LinearGradient>
+          </TouchableOpacity>
+
         </ScrollView>
+
+        {/* ── Export bottom sheet ── */}
+        <Modal
+          visible={showExportSheet}
+          transparent
+          animationType="slide"
+          onRequestClose={() => setShowExport(false)}
+        >
+          <TouchableOpacity
+            style={rm.sheetOverlay}
+            activeOpacity={1}
+            onPress={() => setShowExport(false)}
+          >
+            <View style={rm.sheet}>
+              {/* Sheet handle */}
+              <View style={rm.sheetHandle} />
+              <Text style={rm.sheetTitle}>Export Receipt</Text>
+              <Text style={rm.sheetSub}>#{sale.invoiceNumber}</Text>
+
+              {/* Option 1 — Print */}
+              <TouchableOpacity
+                style={[rm.exportRow, exporting === 'print' && rm.exportRowActive]}
+                onPress={handleThermalPrint}
+                disabled={!!exporting}
+                activeOpacity={0.75}
+              >
+                <View style={[rm.exportIconWrap, { backgroundColor: '#F0F0FA' }]}>
+                  {exporting === 'print'
+                    ? <ActivityIndicator size="small" color={C.navy} />
+                    : <Ionicons name="print-outline" size={22} color={C.navy} />}
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={rm.exportLabel}>Print Receipt</Text>
+                  <Text style={rm.exportSub}>Thermal POS style · Opens print dialog</Text>
+                </View>
+                <Ionicons name="chevron-forward" size={16} color={C.light} />
+              </TouchableOpacity>
+
+              {/* Option 2 — PDF */}
+              <TouchableOpacity
+                style={[rm.exportRow, exporting === 'pdf' && rm.exportRowActive]}
+                onPress={handlePDF}
+                disabled={!!exporting}
+                activeOpacity={0.75}
+              >
+                <View style={[rm.exportIconWrap, { backgroundColor: '#FEE2E2' }]}>
+                  {exporting === 'pdf'
+                    ? <ActivityIndicator size="small" color="#DC2626" />
+                    : <Ionicons name="document-text-outline" size={22} color="#DC2626" />}
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={rm.exportLabel}>Download PDF</Text>
+                  <Text style={rm.exportSub}>Modern A4 receipt · Saved instantly to device</Text>
+                </View>
+                <Ionicons name="chevron-forward" size={16} color={C.light} />
+              </TouchableOpacity>
+
+              {/* Option 3 — JPG / Image */}
+              <TouchableOpacity
+                style={[rm.exportRow, exporting === 'image' && rm.exportRowActive, { borderBottomWidth: 0 }]}
+                onPress={handleImage}
+                disabled={!!exporting}
+                activeOpacity={0.75}
+              >
+                <View style={[rm.exportIconWrap, { backgroundColor: '#ECFDF5' }]}>
+                  {exporting === 'image'
+                    ? <ActivityIndicator size="small" color="#10B981" />
+                    : <Ionicons name="image-outline" size={22} color="#10B981" />}
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={rm.exportLabel}>Download Image</Text>
+                  <Text style={rm.exportSub}>Compact card receipt · Saved instantly to device</Text>
+                </View>
+                <Ionicons name="chevron-forward" size={16} color={C.light} />
+              </TouchableOpacity>
+
+              <TouchableOpacity style={rm.sheetCancelBtn} onPress={() => setShowExport(false)}>
+                <Text style={rm.sheetCancelTxt}>Cancel</Text>
+              </TouchableOpacity>
+            </View>
+          </TouchableOpacity>
+        </Modal>
+
       </SafeAreaView>
     </Modal>
   );
@@ -498,6 +1031,26 @@ const rm = StyleSheet.create({
   actionBtnOutlineTxt: { fontWeight: '700', fontSize: 13 },
   dangerCard:    { borderColor: '#FECACA', borderWidth: 1, backgroundColor: '#FFFAFA' },
   dangerHeader:  { flexDirection: 'row', alignItems: 'center', gap: 5, marginBottom: 10 },
+
+  /* Export button & icon */
+  printIconBtn: { width: 36, height: 36, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.12)', alignItems: 'center', justifyContent: 'center', marginRight: 4 },
+  printBtn:     { marginHorizontal: 16, marginTop: 12, marginBottom: 8, borderRadius: 16, overflow: 'hidden', shadowColor: '#0C0A2E', shadowOpacity: 0.3, shadowRadius: 10, elevation: 5 },
+  printBtnGrad: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, paddingVertical: 16, paddingHorizontal: 20 },
+  printBtnTxt:  { color: '#fff', fontWeight: '800', fontSize: 15, flex: 1, textAlign: 'center' },
+
+  /* Export sheet */
+  sheetOverlay:    { flex: 1, backgroundColor: 'rgba(0,0,0,0.48)', justifyContent: 'flex-end' },
+  sheet:           { backgroundColor: '#fff', borderTopLeftRadius: 28, borderTopRightRadius: 28, paddingBottom: 36 },
+  sheetHandle:     { width: 40, height: 4, borderRadius: 2, backgroundColor: '#E5E7EB', alignSelf: 'center', marginTop: 12, marginBottom: 16 },
+  sheetTitle:      { fontSize: 17, fontWeight: '800', color: C.text, paddingHorizontal: 20, marginBottom: 3 },
+  sheetSub:        { fontSize: 12, color: C.muted, paddingHorizontal: 20, marginBottom: 16 },
+  exportRow:       { flexDirection: 'row', alignItems: 'center', gap: 14, paddingHorizontal: 20, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#F3F4F6' },
+  exportRowActive: { backgroundColor: '#F8F8FF' },
+  exportIconWrap:  { width: 48, height: 48, borderRadius: 14, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
+  exportLabel:     { fontSize: 15, fontWeight: '700', color: C.text, marginBottom: 3 },
+  exportSub:       { fontSize: 11, color: C.muted },
+  sheetCancelBtn:  { marginHorizontal: 20, marginTop: 14, backgroundColor: '#F3F4F6', borderRadius: 14, paddingVertical: 14, alignItems: 'center' },
+  sheetCancelTxt:  { fontSize: 15, fontWeight: '700', color: C.muted },
 });
 
 /* ════════════════════════════════════════
